@@ -1,0 +1,8 @@
+{
+  "name": "Cylinder InfoTrack",
+  "description": "A sophisticated AI-driven inspection system for industrial cylinders with real-time OCR matching, registry management, and multilingual voice summaries.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
