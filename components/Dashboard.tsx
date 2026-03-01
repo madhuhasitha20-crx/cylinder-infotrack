@@ -1,7 +1,7 @@
 
 import React from 'react';
 import { Scan, ShieldCheck, AlertTriangle, FileText, ChevronRight } from 'lucide-react';
-import { Page, AppState } from '../types';
+import { AppState } from '../types';
 
 interface DashboardProps {
   state: AppState;

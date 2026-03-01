@@ -1,8 +1,8 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Camera, Upload, Volume2, Plus, RefreshCcw, Box, Activity, Calendar, Eye, AlertCircle, Maximize2, X, Info } from 'lucide-react';
+import { Camera, Upload, Volume2, Plus, RefreshCcw, Box, Activity, Calendar, Eye, X, Info, AlertCircle, ScanLine } from 'lucide-react';
 import { CylinderRecord, LANGUAGES } from '../types';
-import { performOCR, generateVoiceSummary, analyzeUnregisteredCylinder } from '../services/geminiService';
+import { performOCR, generateVoiceSummary, analyzeUnregisteredCylinder, QuotaExhaustedError } from '../services/geminiService';
 import { matchSerialFromOCR } from '../services/dataService';
 
 interface ScannerProps {
@@ -14,11 +14,13 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
   const [isScanning, setIsScanning] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [result, setResult] = useState<CylinderRecord | null>(null);
+  const [matchConfidence, setMatchConfidence] = useState<'high' | 'low' | 'none'>('none');
   const [selectedLang, setSelectedLang] = useState(''); 
-  const [voiceStatus, setVoiceStatus] = useState<'idle' | 'loading' | 'speaking' | 'quota_error' | 'error'>('idle');
+  const [voiceStatus, setVoiceStatus] = useState<'idle' | 'loading' | 'speaking'>('idle');
+  const [voiceError, setVoiceError] = useState(false);
+  const [quotaExhausted, setQuotaExhausted] = useState(false);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [isImageModalOpen, setIsImageModalOpen] = useState(false);
-  const [autoScanMessage, setAutoScanMessage] = useState('Align marking within frame');
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -31,6 +33,8 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
       setResult(null);
       setPreviewImage(null);
       setVoiceStatus('idle'); 
+      setVoiceError(false);
+      setQuotaExhausted(false);
       const stream = await navigator.mediaDevices.getUserMedia({ 
         video: { 
           facingMode: 'environment',
@@ -60,26 +64,38 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
   const processImage = async (dataUrl: string) => {
     setIsLoading(true);
     setVoiceStatus('idle'); 
+    setVoiceError(false);
+    setQuotaExhausted(false);
     const base64 = dataUrl.split(',')[1];
     
-    const ocrResult = await performOCR(base64);
-    
-    const matchedRecord = matchSerialFromOCR(ocrResult);
-    if (matchedRecord) {
-      setResult(matchedRecord);
-      setIsLoading(false);
-      return;
-    }
+    try {
+      const ocrResult = await performOCR(base64);
+      const match = matchSerialFromOCR(ocrResult);
+      setMatchConfidence(match.confidence);
 
-    setAutoScanMessage('Not in registry... performing vision identification');
-    const unregisteredRecord = await analyzeUnregisteredCylinder(base64, ocrResult || "Unknown Serial");
-    setResult(unregisteredRecord);
-    setIsLoading(false);
+      if (match.record) {
+        setResult(match.record);
+      } else {
+        const unregisteredRecord = await analyzeUnregisteredCylinder(base64, ocrResult || "Unknown Serial");
+        setResult(unregisteredRecord);
+      }
+    } catch (error) {
+      if (error instanceof QuotaExhaustedError) {
+        setQuotaExhausted(true);
+        setIsScanning(false); // Pause auto-scan
+        stopCamera();
+      } else {
+        console.error("Processing error:", error);
+      }
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   useEffect(() => {
     let interval: number;
-    if (isScanning && !result && !isLoading) {
+    // Increased interval to 3000ms to avoid 429 errors
+    if (isScanning && !result && !isLoading && !quotaExhausted) {
       interval = window.setInterval(async () => {
         if (isProcessingRef.current || !videoRef.current || !canvasRef.current) return;
         isProcessingRef.current = true;
@@ -90,17 +106,21 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
           context?.drawImage(videoRef.current, 0, 0);
           const dataUrl = canvasRef.current.toDataURL('image/jpeg', 0.7);
           const base64 = dataUrl.split(',')[1];
+          
           const ocrResult = await performOCR(base64);
+          
           if (ocrResult && ocrResult.length >= 4) {
-            const matchedRecord = matchSerialFromOCR(ocrResult);
-            if (matchedRecord) {
-              setPreviewImage(dataUrl);
-              stopCamera();
-              setResult(matchedRecord);
-              setVoiceStatus('idle'); 
-            }
+            setPreviewImage(dataUrl);
+            stopCamera();
+            setVoiceStatus('idle');
+            await processImage(dataUrl);
           }
         } catch (error) {
+          if (error instanceof QuotaExhaustedError) {
+            setQuotaExhausted(true);
+            setIsScanning(false);
+            stopCamera();
+          }
           console.error("Auto-scan error:", error);
         } finally {
           isProcessingRef.current = false;
@@ -108,7 +128,7 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
       }, 3000);
     }
     return () => clearInterval(interval);
-  }, [isScanning, result, isLoading]);
+  }, [isScanning, result, isLoading, quotaExhausted]);
 
   const captureManual = async () => {
     if (!videoRef.current || !canvasRef.current || isProcessingRef.current) return;
@@ -137,50 +157,59 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
   };
 
   const handleVoiceSummary = async () => {
-    if (!result) return;
-    
-    if (!selectedLang) {
-      alert("Please select a narration language.");
-      return;
-    }
+    if (!result || !selectedLang) return;
 
     if (audioSourceRef.current) {
       try { audioSourceRef.current.stop(); } catch (e) {}
     }
 
     setVoiceStatus('loading');
+    setVoiceError(false);
     const langObj = LANGUAGES.find(l => l.code === selectedLang);
     
-    // Construct simplified narration text with exact requested fields
-    const textToRead = `Serial Number: ${result.serialNumber}. Manufacturer: ${result.manufacturer}. Location: ${result.locationType}. Capacity: ${result.capacity}.`;
+    const lines: string[] = [];
+    const isValid = (val: any) => val !== undefined && val !== null && val !== 'Not Available' && val !== 'Unknown';
 
-    const response = await generateVoiceSummary(textToRead, langObj?.name || 'English', (buffer) => {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      if (ctx.state === 'suspended') ctx.resume();
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      source.onended = () => setVoiceStatus('idle');
-      source.start(0); 
-      audioSourceRef.current = source;
-      setVoiceStatus('speaking');
-    });
+    if (isValid(result.serialNumber)) lines.push(`Serial number: ${result.serialNumber}`);
+    if (isValid(result.cylinderId)) lines.push(`Cylinder ID: ${result.cylinderId}`);
+    if (isValid(result.manufacturer)) lines.push(`Manufacturer: ${result.manufacturer}`);
+    if (isValid(result.locationType)) lines.push(`Location: ${result.locationType}`);
+    if (isValid(result.gasType)) lines.push(`Type: ${result.gasType}`);
+    if (isValid(result.capacity)) lines.push(`Capacity: ${result.capacity}`);
+    if (isValid(result.workingPressure)) lines.push(`Working Pressure: ${result.workingPressure}`);
+    if (isValid(result.testPressure)) lines.push(`Test Pressure: ${result.testPressure}`);
+    if (isValid(result.standardCode)) lines.push(`Standard Code: ${result.standardCode}`);
+    if (isValid(result.testDate)) lines.push(`Test Date: ${result.testDate}`);
+    if (isValid(result.expiryDate)) lines.push(`Expiry Date: ${result.expiryDate}`);
+    if (isValid(result.inspectionDate)) lines.push(`Inspection Date: ${result.inspectionDate}`);
+    if (isValid(result.hazardType)) lines.push(`Hazard Type: ${result.hazardType}`);
+    if (isValid(result.rustLevel)) lines.push(`Rust Level: ${result.rustLevel}`);
+    if (isValid(result.capPresent)) lines.push(`Cap Present: ${result.capPresent}`);
+    if (isValid(result.labelCondition)) lines.push(`Label Condition: ${result.labelCondition}`);
+    lines.push(`Registration status: ${result.isUnregistered ? 'Unregistered' : 'Registered'}`);
 
-    if (!response.success) {
-      // Per request: silently revert to idle state on error.
+    const narrationText = lines.join(". ") + ".";
+
+    try {
+      await generateVoiceSummary(narrationText, langObj?.name || 'English', (buffer) => {
+        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+        if (ctx.state === 'suspended') ctx.resume();
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.onended = () => setVoiceStatus('idle');
+        source.start(0); 
+        audioSourceRef.current = source;
+        setVoiceStatus('speaking');
+        setVoiceError(false);
+      });
+    } catch (err) {
       setVoiceStatus('idle');
+      setVoiceError(true);
     }
   };
 
-  useEffect(() => {
-    return () => {
-      if (audioSourceRef.current) {
-        try { audioSourceRef.current.stop(); } catch (e) {}
-      }
-    };
-  }, []);
-
-  if (isLoading || result) {
+  if (isLoading || result || quotaExhausted) {
     return (
       <div className="h-full overflow-y-auto pb-20 custom-scrollbar">
         {isImageModalOpen && previewImage && (
@@ -202,7 +231,19 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
           {isLoading ? (
             <div className="flex flex-col items-center justify-center py-20 space-y-4 px-6 text-center animate-pulse bg-[#1F2933]/50 rounded-3xl border border-slate-800">
               <RefreshCcw className="w-12 h-12 text-[#2F8F9D] animate-spin" />
-              <p className="text-xl font-medium text-[#EAEAEA]">Performing Detailed Analysis...</p>
+              <p className="text-xl font-medium text-[#EAEAEA]">Performing Detailed Identification...</p>
+            </div>
+          ) : quotaExhausted ? (
+            <div className="flex flex-col items-center justify-center py-20 space-y-4 px-6 text-center bg-[#8B3A3A]/10 rounded-3xl border border-[#8B3A3A]/30 animate-in fade-in">
+              <AlertCircle className="w-12 h-12 text-[#FF6B6B]" />
+              <h2 className="text-xl font-bold text-[#FF6B6B]">Quota Exhausted</h2>
+              <p className="text-[#B0B8C1] max-w-md">The system has reached the Gemini API limit. Please wait a moment for the quota to reset or upgrade your plan.</p>
+              <button 
+                onClick={() => { setQuotaExhausted(false); onNewScan(); }} 
+                className="mt-4 px-6 py-2 bg-[#FF6B6B] text-white rounded-xl font-bold hover:bg-[#FF6B6B]/80 transition-all"
+              >
+                Reset Scanner
+              </button>
             </div>
           ) : result ? (
             <div className="space-y-6">
@@ -211,20 +252,31 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
                   <h1 className="text-3xl lg:text-4xl font-bold break-all text-[#EAEAEA]">{result.serialNumber}</h1>
                   <div className="flex flex-wrap gap-2">
                     {result.isUnregistered ? (
-                      <span className="bg-[#B45309]/20 text-[#fbbf24] text-[10px] font-bold px-3 py-1.5 rounded-md uppercase border border-[#B45309]/40 flex items-center gap-2 shadow-sm">
-                        <Info size={14} /> UNREGISTERED CYLINDER – BASIC DETAILS IDENTIFIED
+                      <span className="bg-[#8B3A3A]/20 text-[#FF6B6B] text-[10px] font-bold px-3 py-1.5 rounded-md uppercase border border-[#8B3A3A]/40 flex items-center gap-2 shadow-sm">
+                        <AlertCircle size={14} /> No matching cylinder record found in the uploaded database.
                       </span>
                     ) : (
-                      <span className="bg-[#3D7A5D]/20 text-[#4ade80] text-[10px] font-bold px-3 py-1.5 rounded-md uppercase border border-[#3D7A5D]/40 shadow-sm">
-                        MATCHED: {result.remarks.toUpperCase()}
-                      </span>
+                      <div className="flex gap-2">
+                        <span className="bg-[#3D7A5D]/20 text-[#4ade80] text-[10px] font-bold px-3 py-1.5 rounded-md uppercase border border-[#3D7A5D]/40 shadow-sm">
+                          MATCHED: {result.remarks.toUpperCase()}
+                        </span>
+                        {matchConfidence === 'low' && (
+                          <span className="bg-[#B45309]/20 text-[#fbbf24] text-[10px] font-bold px-3 py-1.5 rounded-md uppercase border border-[#B45309]/40 flex items-center gap-2 shadow-sm">
+                            <Info size={14} /> Low confidence match – serial number partially unclear.
+                          </span>
+                        )}
+                      </div>
                     )}
                     <span className="bg-[#3A5F7D]/20 text-[#60a5fa] text-[10px] font-bold px-3 py-1.5 rounded-md uppercase border border-[#3A5F7D]/40 shadow-sm">{result.gasType}</span>
                   </div>
                 </div>
                 <div className="w-full sm:w-auto">
                    <label className="text-[10px] text-[#B0B8C1] font-bold uppercase tracking-widest block mb-1">Narration Language</label>
-                   <select value={selectedLang} onChange={(e) => { setSelectedLang(e.target.value); setVoiceStatus('idle'); }} className="w-full sm:w-auto bg-[#1F2933] border border-slate-700 text-[#EAEAEA] px-4 py-2 rounded-lg text-xs focus:outline-none focus:border-[#2F8F9D]">
+                   <select 
+                     value={selectedLang} 
+                     onChange={(e) => { setSelectedLang(e.target.value); setVoiceStatus('idle'); setVoiceError(false); }} 
+                     className="w-full sm:w-auto bg-[#1F2933] border border-slate-700 text-[#EAEAEA] px-4 py-2 rounded-lg text-xs focus:outline-none focus:border-[#2F8F9D]"
+                   >
                      <option value="">Select Language</option>
                      {LANGUAGES.map(l => (
                        <option key={l.code} value={l.code}>{l.name.toUpperCase()}</option>
@@ -258,23 +310,31 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
               </div>
 
               <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4 pt-6 border-t border-slate-800">
-                <button 
-                  onClick={handleVoiceSummary} 
-                  disabled={voiceStatus === 'loading'} 
-                  className={`flex items-center justify-center gap-2 px-6 py-4 rounded-xl transition-all font-bold text-sm border 
-                    ${voiceStatus === 'loading' ? 'bg-[#6D5BD0]/5 cursor-not-allowed opacity-50' : 'bg-[#6D5BD0]/10 text-[#6D5BD0] border-[#6D5BD0]/30 hover:bg-[#6D5BD0]/20'}`}
-                >
-                  {voiceStatus === 'loading' ? <RefreshCcw size={18} className="animate-spin" /> : 
-                   <Volume2 size={18} className={voiceStatus === 'speaking' ? "animate-bounce" : ""} />}
-                  
-                  {voiceStatus === 'loading' ? "Synthesizing..." : 
-                   voiceStatus === 'speaking' ? "Speaking..." : 
-                   "Voice Narration"}
-                </button>
+                <div className="flex flex-col gap-2">
+                  <button 
+                    onClick={handleVoiceSummary} 
+                    disabled={voiceStatus === 'loading'} 
+                    className={`flex items-center justify-center gap-2 px-6 py-4 rounded-xl transition-all font-bold text-sm border 
+                      ${voiceStatus === 'loading' ? 'bg-[#6D5BD0]/5 cursor-not-allowed opacity-50' : 'bg-[#6D5BD0]/10 text-[#6D5BD0] border-[#6D5BD0]/30 hover:bg-[#6D5BD0]/20'}`}
+                  >
+                    {voiceStatus === 'loading' ? <RefreshCcw size={18} className="animate-spin" /> : 
+                     <Volume2 size={18} className={voiceStatus === 'speaking' ? "animate-bounce" : ""} />}
+                    
+                    {voiceStatus === 'loading' ? "Synthesizing..." : 
+                     voiceStatus === 'speaking' ? "Speaking..." : 
+                     "Voice Summary"}
+                  </button>
+                  {voiceError && (
+                    <div className="flex items-center gap-1.5 text-red-400 text-[10px] font-bold uppercase tracking-wider animate-in fade-in">
+                      <AlertCircle size={12} />
+                      Voice Error
+                    </div>
+                  )}
+                </div>
                 <button onClick={() => onCommit(result)} className="flex-1 bg-[#2F8F9D] hover:bg-[#2F8F9D]/90 text-white px-8 py-4 rounded-xl font-bold transition-all flex items-center justify-center gap-2 shadow-lg shadow-[#2F8F9D]/30">
                   <Plus size={20} /> Commit to Inventory Registry
                 </button>
-                <button onClick={() => { setResult(null); setPreviewImage(null); setVoiceStatus('idle'); onNewScan(); }} className="px-6 py-4 text-[#B0B8C1] hover:text-white transition-all font-bold text-sm uppercase tracking-widest">
+                <button onClick={() => { setResult(null); setPreviewImage(null); setVoiceStatus('idle'); setVoiceError(false); onNewScan(); }} className="px-6 py-4 text-[#B0B8C1] hover:text-white transition-all font-bold text-sm uppercase tracking-widest">
                   NEW SCAN
                 </button>
               </div>
@@ -289,7 +349,9 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
     <div className="p-4 lg:p-8 max-w-5xl mx-auto space-y-6 animate-in fade-in duration-500">
       <div className="flex justify-between items-center mb-4">
         <h2 className="text-xl lg:text-2xl font-bold flex items-center gap-3 text-[#EAEAEA]">
-          <div className="w-8 h-8 rounded bg-[#2F8F9D]/10 flex items-center justify-center"><ScanLine className="text-[#2F8F9D] w-5 h-5" /></div>
+          <div className="w-8 h-8 rounded bg-[#2F8F9D]/10 flex items-center justify-center">
+            <ScanLine className="text-[#2F8F9D] w-5 h-5" />
+          </div>
           Cylinder Vision Scanner
         </h2>
       </div>
@@ -299,11 +361,6 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
           {isScanning ? (
             <div className="absolute inset-0 z-10 flex flex-col bg-black">
               <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <div className="w-4/5 h-1/4 border-2 border-[#2F8F9D] rounded-lg shadow-[0_0_50px_rgba(47,143,157,0.5)]">
-                  <div className="absolute top-0 left-0 w-full h-1 bg-[#2F8F9D] animate-[scan_2s_ease-in-out_infinite] opacity-70"></div>
-                </div>
-              </div>
               <div className="absolute bottom-6 left-0 right-0 flex justify-center px-8 gap-4">
                 <button onClick={captureManual} className="bg-[#2F8F9D] text-white flex-1 py-4 rounded-2xl font-bold hover:scale-105 transition-all shadow-xl text-sm border border-white/10 active:scale-95">Manual Capture</button>
                 <button onClick={stopCamera} className="bg-red-500/20 text-red-400 px-6 py-4 rounded-2xl font-bold text-xs uppercase tracking-widest border border-red-500/30 active:scale-95">Close</button>
@@ -329,21 +386,8 @@ const Scanner: React.FC<ScannerProps> = ({ onCommit, onNewScan }) => {
       </div>
 
       <canvas ref={canvasRef} className="hidden" />
-      <style>{`
-        @keyframes scan {
-          0% { transform: translateY(-100%); }
-          50% { transform: translateY(400%); }
-          100% { transform: translateY(-100%); }
-        }
-      `}</style>
     </div>
   );
 };
-
-const ScanLine = ({ className, ...props }: any) => (
-  <svg {...props} className={className} xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" /><path d="M7 12h10" />
-  </svg>
-);
 
 export default Scanner;

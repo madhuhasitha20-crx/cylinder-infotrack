@@ -2,42 +2,74 @@
 import { CylinderRecord } from '../types';
 import { REGISTRY } from '../constants';
 
+export interface MatchResult {
+  record: CylinderRecord | null;
+  confidence: 'high' | 'low' | 'none';
+}
+
 /**
- * Performs a global matching of OCR text against the entire cylinder registry.
- * Implements strict reconstruction rules:
- * - Minimum 4 continuous digits or characters required for a match.
- * - Prioritizes full alphanumeric strings, then digit-only sequences.
- * - Ensures that if a match exists in the PDF (REGISTRY), it is treated as a Registered Cylinder.
+ * Performs a matching of OCR text against the cylinder registry following 
+ * strict industrial rules for partial or damaged markings.
  */
-export const matchSerialFromOCR = (ocrText: string): CylinderRecord | null => {
-  if (!ocrText || ocrText.length < 4) return null;
+export const matchSerialFromOCR = (ocrText: string): MatchResult => {
+  if (!ocrText || ocrText.trim().length < 4) {
+    return { record: null, confidence: 'none' };
+  }
 
-  // Clean the input to remove noise but keep alphanumeric core
-  const cleanedOcr = ocrText.toUpperCase().trim().replace(/[^A-Z0-9]/g, '');
-  const ocrDigits = ocrText.replace(/\D/g, '');
+  const cleanedOcr = ocrText.toUpperCase().trim();
+  const ocrDigits = cleanedOcr.replace(/\D/g, '');
 
-  // 1. Alphanumeric Substring Match (Case-insensitive, stripped of noise)
-  // We check if the OCR fragment (min 4 chars) is contained within any registry serial
-  // or if the registry serial is contained within the OCR fragment.
+  let bestMatch: CylinderRecord | null = null;
+  let highestScore = 0;
+  let matchConfidence: 'high' | 'low' | 'none' = 'none';
+
   for (const record of REGISTRY) {
-    const regSerial = record.serialNumber.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (cleanedOcr.length >= 4 && (regSerial.includes(cleanedOcr) || cleanedOcr.includes(regSerial))) {
-      return record;
-    }
-  }
+    const regSerial = record.serialNumber.toUpperCase();
+    const regDigits = regSerial.replace(/\D/g, '');
+    
+    let currentScore = 0;
 
-  // 2. Digit Sequence Match (Fallback)
-  // Extract digits from OCR and try to find a match in registry digits (min 4).
-  if (ocrDigits.length >= 4) {
-    for (const record of REGISTRY) {
-      const regDigits = record.serialNumber.replace(/\D/g, '');
-      if (regDigits.includes(ocrDigits) || ocrDigits.includes(regDigits)) {
-        return record;
+    // 1. Exact Match Priority
+    if (cleanedOcr === regSerial) {
+      return { record, confidence: 'high' };
+    }
+
+    // 2. Longest Numeric Sequence Match
+    if (ocrDigits.length >= 4 && regDigits.includes(ocrDigits)) {
+      currentScore += 50;
+    }
+
+    // 3. Suffix Matching (e.g., .S, .T, .B)
+    const ocrSuffix = cleanedOcr.split('.').pop() || '';
+    const regSuffix = regSerial.split('.').pop() || '';
+    if (ocrSuffix && ocrSuffix === regSuffix && ocrSuffix.length === 1) {
+      currentScore += 30;
+    }
+
+    // 4. Character Overlap / Fuzzy Similarity
+    if (cleanedOcr.length >= 4) {
+      let overlap = 0;
+      for (let i = 0; i < cleanedOcr.length; i++) {
+        if (regSerial.includes(cleanedOcr[i])) overlap++;
       }
+      currentScore += (overlap / regSerial.length) * 20;
+    }
+
+    if (currentScore > highestScore) {
+      highestScore = currentScore;
+      bestMatch = record;
     }
   }
 
-  // 3. Reconstruct Match exists in registry PDF? 
-  // If we get here, no match was found in the 181-record PDF registry.
-  return null;
+  // Thresholds for confidence levels
+  if (highestScore >= 80) {
+    matchConfidence = 'high';
+  } else if (highestScore >= 40) {
+    matchConfidence = 'low';
+  } else {
+    bestMatch = null;
+    matchConfidence = 'none';
+  }
+
+  return { record: bestMatch, confidence: matchConfidence };
 };
